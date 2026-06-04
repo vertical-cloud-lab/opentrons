@@ -115,7 +115,7 @@ the 8.25 mm error.
 | No tip‑length calibration | `84 − 8.25 = 75.75 mm` | **8.25 mm too short** |
 | Tip‑length calibration done | calibrated (≈ real) | ~0 mm |
 
-An 8.25 mm vertical error is exactly the "it should *deeefinitely* pick it up but just
+An 8.25 mm vertical error is exactly the "this should *definitely* pick it up but it just
 misses" behavior seen in the failure video.
 
 ## Recommended fixes
@@ -173,7 +173,10 @@ adjusted) tip critical point.
    (Fix A).
 3. If you cannot calibrate, set the labware `tipLength` to `92.25` (Fix B) so the fallback
    geometry is correct.
-4. Re‑verify the `−1.3 mm` measurement offset and the `−80 mm` return‑drop offset after the
-   tip model is corrected — those were tuned against the *previous* (calibrated) geometry and
-   may shift by up to the 8.25 mm error once the model is right.
+4. Re‑verify the two carried‑over offsets after the tip model is corrected — the `−1.3 mm`
+   measurement offset (how far below the target well top the sensor is lowered to take a
+   reading, used in `protocol_pick_move_return.py`) and the `−80 mm` return‑drop offset (how
+   far the sensor is lowered back into its charging port on return). Both were tuned against
+   the *previous* (calibrated) geometry and may shift by up to the 8.25 mm error once the
+   model is right.
 5. Keep generous `z` clearance on transit moves (Fix C).
