@@ -213,30 +213,37 @@ number ≥ `2`; see `robot-server/robot_server/versioning.py`, `API_VERSION_HEAD
 
 ```bash
 BASE=http://<ROBOT_IP>:31950
-HDR='-H Opentrons-Version:* -H Content-Type:application/json'
+# Use explicit -H flags so the version header (note the literal "*") is sent verbatim.
+post_cmd() {
+  curl -s -H 'Opentrons-Version: *' -H 'Content-Type: application/json' \
+    -X POST "$BASE/runs/$RUN/commands?waitUntilComplete=true" -d "$1"
+}
 
 # 1. Create an empty run (no protocol file).
-RUN=$(curl -s $HDR -X POST $BASE/runs -d '{"data":{}}' | jq -r .data.id)
+RUN=$(curl -s -H 'Opentrons-Version: *' -H 'Content-Type: application/json' \
+  -X POST $BASE/runs -d '{"data":{}}' | jq -r .data.id)
 
-# 2. Register the custom "tip rack" definition with this run.
-curl -s $HDR -X POST $BASE/runs/$RUN/labware_definitions \
-  -d @byu_color_sensor_charging_port.json   # wrap as {"data": <definition>}
+# 2. Register the custom "tip rack" definition with this run (body must be {"data": <def>}).
+curl -s -H 'Opentrons-Version: *' -H 'Content-Type: application/json' \
+  -X POST $BASE/runs/$RUN/labware_definitions \
+  -d "{\"data\":$(cat byu_color_sensor_charging_port.json)}"
 
 # 3. Enqueue setup commands. With data.source == "setup" and ?waitUntilComplete=true
-#    they execute immediately, in order — no `play` action required.
-post() { curl -s $HDR -X POST "$BASE/runs/$RUN/commands?waitUntilComplete=true" -d "$1"; }
-
-post '{"data":{"commandType":"loadPipette","params":{
-  "pipetteName":"p20_single_gen2","mount":"left"}}}'                     # note the mount
-post '{"data":{"commandType":"loadLabware","params":{
+#    they execute immediately, in order — no `play` action required. Capture the ids the
+#    load* commands return and reuse them as pipetteId / labwareId below.
+post_cmd '{"data":{"commandType":"loadPipette","params":{
+  "pipetteName":"p20_single_gen2","mount":"left"}}}'                     # -> <pipetteId>
+post_cmd '{"data":{"commandType":"loadLabware","params":{
   "location":{"slotName":"10"},"loadName":"byu_color_sensor_charging_port",
-  "namespace":"custom_beta","version":1}}}'
-post '{"data":{"commandType":"pickUpTip","params":{
-  "pipetteId":"<from loadPipette result>","labwareId":"<from loadLabware result>",
-  "wellName":"A2"}}}'                                                     # programmatic pickup
-post '{"data":{"commandType":"moveToWell","params":{
-  "pipetteId":"...","labwareId":"<plate>","wellName":"A1",
-  "wellLocation":{"origin":"top","offset":{"x":0,"y":0,"z":-1.3}}}}}'     # hard‑coded offset
+  "namespace":"custom_beta","version":1}}}'                             # -> <tiprackId>
+post_cmd '{"data":{"commandType":"loadLabware","params":{
+  "location":{"slotName":"1"},"loadName":"corning_96_wellplate_360ul_flat",
+  "namespace":"opentrons","version":1}}}'                               # -> <plateId>
+post_cmd '{"data":{"commandType":"pickUpTip","params":{
+  "pipetteId":"<pipetteId>","labwareId":"<tiprackId>","wellName":"A2"}}}'
+post_cmd '{"data":{"commandType":"moveToWell","params":{
+  "pipetteId":"<pipetteId>","labwareId":"<plateId>","wellName":"A1",
+  "wellLocation":{"origin":"top","offset":{"x":0,"y":0,"z":-1.3}}}}}'    # hard‑coded offset
 ```
 
 Notes:
