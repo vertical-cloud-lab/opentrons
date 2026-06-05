@@ -34,7 +34,8 @@ work is based on:
   the field). Absent a saved tip‑length calibration the sensor is modeled
   `84 − 8.25 = 75.75 mm` long, which also shifts every tip‑referenced move by 8.25 mm.
 * Recommended fixes, in order: **(A)** run the protocol the way the AC reference does —
-  programmatic `pick_up_tip` + hard‑coded offsets, no App calibration; **(B)** if you must use
+  programmatic `pick_up_tip` + hard‑coded offsets, no App calibration (on‑robot, or
+  headlessly over the robot's **HTTP API** — see Fix A‑HTTP); **(B)** if you must use
   the App, perform tip‑length calibration for the rack on the robot; **(C)** as a
   no‑calibration geometry workaround, bake the ignored overlap into `tipLength`
   (`84 + 8.25 = 92.25`).
@@ -195,6 +196,64 @@ the robot** instead of going through the Opentrons App's tip/labware calibration
 This is the configuration that is validated on hardware. The App calibration flow is the
 thing that errors for an oversized custom "tip rack," so the reliable fix is to not use it.
 
+### Fix A‑HTTP — Drive it over the robot's HTTP API instead of the App
+
+If you want to stay off the robot's shell (no SSH / Jupyter) but still bypass the App's
+calibration flow, talk to the same robot software directly over its **HTTP API**
+(`robot-server`, port `31950`). This is the headless equivalent of Fix A: you enqueue the
+exact same Protocol‑Engine commands (`loadPipette`, `loadLabware`, `pickUpTip`, `moveToWell`,
+`dropTip`) that `pick_up_tip()` / `move_to()` produce on‑robot, so the App's tip‑length /
+Labware Position Check step that throws is never invoked. The `POST /runs/{runId}/commands`
+endpoint documents this explicitly: *"You can create a protocol purely over HTTP using
+protocol commands"* (`robot-server/robot_server/runs/router/commands_router.py`).
+
+Every request needs the version header `Opentrons-Version` (use `*` for the latest, or a
+number ≥ `2`; see `robot-server/robot_server/versioning.py`, `API_VERSION_HEADER`). Replace
+`<ROBOT_IP>` with the OT‑2's address.
+
+```bash
+BASE=http://<ROBOT_IP>:31950
+HDR='-H Opentrons-Version:* -H Content-Type:application/json'
+
+# 1. Create an empty run (no protocol file).
+RUN=$(curl -s $HDR -X POST $BASE/runs -d '{"data":{}}' | jq -r .data.id)
+
+# 2. Register the custom "tip rack" definition with this run.
+curl -s $HDR -X POST $BASE/runs/$RUN/labware_definitions \
+  -d @byu_color_sensor_charging_port.json   # wrap as {"data": <definition>}
+
+# 3. Enqueue setup commands. With data.source == "setup" and ?waitUntilComplete=true
+#    they execute immediately, in order — no `play` action required.
+post() { curl -s $HDR -X POST "$BASE/runs/$RUN/commands?waitUntilComplete=true" -d "$1"; }
+
+post '{"data":{"commandType":"loadPipette","params":{
+  "pipetteName":"p20_single_gen2","mount":"left"}}}'                     # note the mount
+post '{"data":{"commandType":"loadLabware","params":{
+  "location":{"slotName":"10"},"loadName":"byu_color_sensor_charging_port",
+  "namespace":"custom_beta","version":1}}}'
+post '{"data":{"commandType":"pickUpTip","params":{
+  "pipetteId":"<from loadPipette result>","labwareId":"<from loadLabware result>",
+  "wellName":"A2"}}}'                                                     # programmatic pickup
+post '{"data":{"commandType":"moveToWell","params":{
+  "pipetteId":"...","labwareId":"<plate>","wellName":"A1",
+  "wellLocation":{"origin":"top","offset":{"x":0,"y":0,"z":-1.3}}}}}'     # hard‑coded offset
+```
+
+Notes:
+
+* Commands tagged `"setup"` (the default for ad‑hoc commands) run as soon as they are
+  enqueued, so for an interactive driver you do not need `POST /runs/{runId}/actions`
+  (`{"data":{"actionType":"play"}}`) at all. Use the `play` action only if you switch to
+  `intent: "protocol"` commands.
+* Capture the `data.id` returned by each `loadPipette` / `loadLabware` response and feed it
+  back as `pipetteId` / `labwareId` — the engine references loaded items by id, not by name.
+* This path uses the **same** nominal tip geometry as Fix A, so the 8.25 mm overlap shift
+  still applies unless you either save a tip‑length calibration or apply the Fix C
+  `tipLength` compensation below.
+
+The Opentrons HTTP API can be driven from any HTTP client — `curl`, Python `requests`, or
+the Opentrons HTTP API JS client — all against these same `robot-server` endpoints.
+
 ### Fix B — If you must use the App, calibrate tip length for the custom rack
 
 If you need the App workflow, you must complete a **tip‑length calibration** for the custom
@@ -243,7 +302,8 @@ adjusted) tip critical point.
 
 1. Prefer the AC reference execution path: run on the robot via `opentrons_execute` / Jupyter
    / Prefect with programmatic `pick_up_tip`, and **don't** run the App's tip‑length /
-   Labware Position Check calibration for the WCS rack (Fix A).
+   Labware Position Check calibration for the WCS rack (Fix A). To stay headless without SSH,
+   drive the same commands over the robot's HTTP API (Fix A‑HTTP).
 2. Load the `p20_single_gen2` on the **left** mount (already corrected in PR #116). Note the
    AC reference uses `p300_single_gen2` on the **right** mount.
 3. If you do use the App, perform **tip‑length calibration** for
