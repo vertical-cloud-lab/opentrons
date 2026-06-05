@@ -3,27 +3,82 @@
 This note diagnoses the failure reported in
 [`vertical-cloud-lab/byu-vcl#116`](https://github.com/vertical-cloud-lab/byu-vcl/pull/116)
 and [`byu-vcl#33`](https://github.com/vertical-cloud-lab/byu-vcl/issues/33): an OT‑2
-cannot reliably pick up / calibrate the wireless color sensor (WCS), which is modeled as
-an oversized "tip" using a custom tip‑rack labware definition
+throws an **actual error while calibrating** the wireless color sensor (WCS), which is
+modeled as an oversized "tip" using a custom tip‑rack labware definition
 (`byu_color_sensor_charging_port.json`, `isTiprack: true`, `tipLength: 84`,
 `tipOverlap: 0`).
 
-The investigation here is against the Opentrons robot software (this repository), which is
-where the relevant tip‑height math lives.
+The investigation here is against the Opentrons robot software (this repository), where the
+tip‑height math lives, and against the **canonical, hardware‑validated reference** the BYU
+work is based on:
+[`AccelerationConsortium/ac-dev-lab`](https://github.com/AccelerationConsortium/ac-dev-lab)
+(`src/ac_training_lab/ot-2/_scripts/`), plus the build guide at
+[`AccelerationConsortium/wireless-color-sensor`](https://github.com/AccelerationConsortium/wireless-color-sensor).
 
 ## TL;DR
 
-* The robot software **ignores the `parameters.tipOverlap` value in a labware
-  definition.** Tip overlap is always taken from the **pipette** configuration, and for
-  an unknown (custom) tip‑rack it falls back to the pipette's `default` overlap.
-* For a `p20_single_gen2`, that default overlap is **8.25 mm**.
-* So the custom labware's `tipOverlap: 0` has **no effect**. After "picking up" the WCS,
-  the robot models the sensor as `tipLength − 8.25 = 84 − 8.25 = 75.75 mm` long instead of
-  the intended 84 mm. Every subsequent move that is referenced to the tip end is therefore
-  off by **8.25 mm**, which is what makes calibration/pickup look like it "just misses."
-* The fix is to **calibrate tip length for the custom rack on the robot** (primary), and/or
-  to **bake the ignored overlap into `tipLength`** in the JSON (no‑calibration workaround):
-  set `tipLength` to `84 + 8.25 = 92.25`.
+* The error is thrown **in the Opentrons App's calibration flow** (tip‑length calibration /
+  Labware Position Check), not at protocol analysis time. The BYU protocols analyze/simulate
+  cleanly; the failure is on the robot during the App's interactive calibration of this
+  oversized custom "tip rack."
+* **The AC reference never calibrates this rack through the App.** Its `device.py` runs the
+  protocol *directly on the robot* (via Jupyter/SSH/Prefect, using
+  `opentrons.simulate.get_protocol_api`), calls `pick_up_tip()` on the custom rack
+  programmatically, and reaches the measurement/charging positions with **hard‑coded `z`
+  offsets** — so the App calibration flow that throws the error is bypassed entirely. This is
+  the single most important difference from the BYU setup and the recommended fix.
+* The robot software also **ignores the `parameters.tipOverlap` value in a labware
+  definition.** Tip overlap is always taken from the **pipette** configuration, falling back
+  to the pipette's `default` for an unknown custom rack. For a `p20_single_gen2` that default
+  is **8.25 mm**, so the BYU `tipOverlap: 0` has no effect (and the AC reference simply omits
+  the field). Absent a saved tip‑length calibration the sensor is modeled
+  `84 − 8.25 = 75.75 mm` long, which also shifts every tip‑referenced move by 8.25 mm.
+* Recommended fixes, in order: **(A)** run the protocol the way the AC reference does —
+  programmatic `pick_up_tip` + hard‑coded offsets, no App calibration; **(B)** if you must use
+  the App, perform tip‑length calibration for the rack on the robot; **(C)** as a
+  no‑calibration geometry workaround, bake the ignored overlap into `tipLength`
+  (`84 + 8.25 = 92.25`).
+
+## The canonical AC reference (what actually works on hardware)
+
+The BYU labware and protocols are rebrands of the AC reference. The reference's on‑robot
+driver is
+[`src/ac_training_lab/ot-2/_scripts/prefect/device.py`](https://github.com/AccelerationConsortium/ac-dev-lab/blob/main/src/ac_training_lab/ot-2/_scripts/prefect/device.py):
+
+```python
+import opentrons.simulate
+protocol = opentrons.simulate.get_protocol_api("2.12")   # run ON the robot, not via the App
+protocol.home()
+
+with open("../ac_color_sensor_charging_port.json") as f1:
+    tiprack_2 = protocol.load_labware_from_definition(json.load(f1), 10)
+# ...
+p300 = protocol.load_instrument("p300_single_gen2", mount="right", tip_racks=[tiprack_1])
+
+@flow
+def move_sensor_to_measurement_position(mix_well):
+    p300.pick_up_tip(tiprack_2["A2"])            # programmatic pickup, no App calibration
+    p300.move_to(plate[mix_well].top(z=-1.3))    # hard‑coded measurement offset
+
+@flow
+def move_sensor_back():
+    p300.drop_tip(tiprack_2["A2"].top(z=-80))    # hard‑coded return‑drop offset
+```
+
+Key properties of the reference, and how the BYU setup diverged:
+
+| Aspect | AC reference (`ac-dev-lab`) | BYU PR #116 |
+| --- | --- | --- |
+| Execution path | On‑robot `opentrons.simulate.get_protocol_api` served via Prefect/MQTT (Jupyter/SSH) — **App calibration never used** | Uploaded to the **Opentrons App**, then ran the App's tip/labware **calibration** → error |
+| Pipette / mount | `p300_single_gen2`, **right** mount | `p20_single_gen2`, **left** mount |
+| Custom labware | `ac_color_sensor_charging_port.json`, `tipLength: 84`, **no `tipOverlap`** | `byu_color_sensor_charging_port.json`, `tipLength: 84`, `tipOverlap: 0` (ignored anyway) |
+| Tip pickup | `pick_up_tip()` in code, nominal geometry | App calibration flow |
+| Reaching targets | Hard‑coded `z` offsets (`-1.3` measure, `-80` return) | Same offsets, but only after App calibration |
+
+Because the reference drives `pick_up_tip` programmatically and never asks the App to
+calibrate an 84 mm "tip," it sidesteps the calibration error the BYU team hit. The reference
+labware also **omits `tipOverlap` entirely** — confirming the field is not what makes this
+work (the robot ignores it; see below).
 
 ## Why versions matter ("v9 changes")
 
@@ -35,10 +90,12 @@ governed by the Protocol Engine code paths described below.
 
 Crucially, **neither the Protocol Engine nor the legacy helper ever reads
 `parameters.tipOverlap` from the labware** — both use the *pipette's* overlap table. So a
-custom rack that "worked" on older hardware almost certainly worked because a **tip‑length
-calibration had been performed for it**, not because `tipOverlap: 0` was honored. Moving to
-a fresh robot / fresh app, or re‑printing the sensor, loses that calibration and re‑exposes
-the 8.25 mm error.
+custom rack "works" not because `tipOverlap: 0` (or any labware overlap) is honored, but
+because the AC reference avoids the App calibration that throws and drives `pick_up_tip`
+programmatically (and, where needed, a saved tip‑length calibration overrides the nominal
+geometry). Moving to the App's calibration flow — or to a fresh robot / fresh app, or
+re‑printing the sensor — re‑exposes both the thrown calibration error and the 8.25 mm
+geometry shift.
 
 ## Root cause, with code references
 
@@ -115,25 +172,43 @@ the 8.25 mm error.
 | No tip‑length calibration | `84 − 8.25 = 75.75 mm` | **8.25 mm too short** |
 | Tip‑length calibration done | calibrated (≈ real) | ~0 mm |
 
-An 8.25 mm vertical error is exactly the "this should *definitely* pick it up but it just
-misses" behavior seen in the failure video.
+An 8.25 mm vertical error compounds the primary problem: even after you get past the App
+calibration error, a mis‑modeled tip length shifts every tip‑referenced move, consistent with
+the "this should *definitely* pick it up but it just misses" behavior seen in the failure
+video.
 
 ## Recommended fixes
 
-### Fix A — Calibrate tip length for the custom rack (primary, do this regardless)
+### Fix A — Run it like the AC reference: programmatic pickup, no App calibration (primary)
 
-Any custom tip‑rack on an OT‑2 must have a **tip‑length calibration** before its geometry
-is trusted. In the Opentrons App: *Robot → Calibration → Tip Length Calibration* (or the
-labware/Labware Position Check flow), select the `byu_color_sensor_charging_port` rack and
-the left‑mount `p20_single_gen2`, and complete the guided jog. This stores a calibrated
-length that overrides the nominal `tipLength − 8.25` fallback (see `tip_handler.py` above),
-which removes the 8.25 mm error.
+The reference avoids the calibration step that throws by executing the protocol **directly on
+the robot** instead of going through the Opentrons App's tip/labware calibration flow:
 
-If the *calibration flow itself* errors out, check Fix C (deck/Z envelope) and re‑seat / re‑print
-a straight sensor body — a bent or stretched sensor changes the real length and defeats any
-calibration.
+* Put the protocol on the robot and run it with `opentrons_execute` over SSH, from the
+  robot's Jupyter notebook, or via the Prefect/MQTT `serve` pattern in `device.py` —
+  i.e. `opentrons.simulate.get_protocol_api("2.12")` executed on the OT‑2.
+* Call `pipette.pick_up_tip(charging_port["A2"])` in code; do **not** run the App's tip‑length
+  calibration or Labware Position Check for the WCS rack.
+* Reach the measurement / charging positions with explicit hard‑coded offsets
+  (`plate[well].top(z=-1.3)`, `charging_port["A2"].top(z=-80)`), exactly as the reference does.
 
-### Fix B — Compensate for the ignored overlap directly in the JSON (no‑calibration workaround)
+This is the configuration that is validated on hardware. The App calibration flow is the
+thing that errors for an oversized custom "tip rack," so the reliable fix is to not use it.
+
+### Fix B — If you must use the App, calibrate tip length for the custom rack
+
+If you need the App workflow, you must complete a **tip‑length calibration** for the custom
+rack before its geometry is trusted: *Robot → Calibration → Tip Length Calibration* (or the
+Labware Position Check flow), select the `byu_color_sensor_charging_port` rack and the
+left‑mount `p20_single_gen2`, and complete the guided jog. This stores a calibrated length
+that overrides the nominal `tipLength − 8.25` fallback (see `tip_handler.py` above) and
+removes the 8.25 mm geometry shift.
+
+If the *calibration flow itself* errors out, fall back to Fix A, check Fix D (deck/Z
+envelope), and re‑seat / re‑print a straight sensor body — a bent or stretched sensor changes
+the real length and defeats any calibration.
+
+### Fix C — Compensate for the ignored overlap directly in the JSON (no‑calibration workaround)
 
 Because the engine subtracts the pipette `default` overlap (8.25 mm for `p20_single_gen2`)
 and ignores `parameters.tipOverlap`, make the *nominal* model match reality by adding that
@@ -150,13 +225,11 @@ overlap back into `tipLength`:
 ```
 
 With `tipLength = 92.25`, the nominal effective length becomes `92.25 − 8.25 = 84 mm`,
-matching the physical sensor even when no tip‑length calibration is present.
+matching the physical sensor even when no tip‑length calibration is present. (The AC reference
+instead uses `p300_single_gen2`, whose `default` overlap differs — always re‑derive against
+the pipette you actually load; see `shared-data` `tipOverlap.default`.)
 
-> Note: if you change the pipette (e.g. to a GEN1 or a different model), look up that
-> pipette's `tipOverlap.default` in `shared-data` and re‑derive `tipLength` accordingly.
-> This is why Fix A (calibration) is preferred — it is pipette‑specific and measured.
-
-### Fix C — Watch the Z / deck envelope when carrying an ~84 mm "tip"
+### Fix D — Watch the Z / deck envelope when carrying an ~84 mm "tip"
 
 An 84 mm "tip" plus a target labware can exceed the OT‑2's usable Z travel and trigger an
 out‑of‑bounds / deck‑conflict error that *looks* like a calibration failure. When moving the
@@ -168,15 +241,18 @@ adjusted) tip critical point.
 
 ## Checklist for the BYU protocols
 
-1. Load the `p20_single_gen2` on the **left** mount (already corrected in PR #116).
-2. Perform **tip‑length calibration** for `byu_color_sensor_charging_port` on the robot
-   (Fix A).
-3. If you cannot calibrate, set the labware `tipLength` to `92.25` (Fix B) so the fallback
-   geometry is correct.
-4. Re‑verify the two carried‑over offsets after the tip model is corrected — the `−1.3 mm`
+1. Prefer the AC reference execution path: run on the robot via `opentrons_execute` / Jupyter
+   / Prefect with programmatic `pick_up_tip`, and **don't** run the App's tip‑length /
+   Labware Position Check calibration for the WCS rack (Fix A).
+2. Load the `p20_single_gen2` on the **left** mount (already corrected in PR #116). Note the
+   AC reference uses `p300_single_gen2` on the **right** mount.
+3. If you do use the App, perform **tip‑length calibration** for
+   `byu_color_sensor_charging_port` on the robot (Fix B).
+4. If you cannot calibrate, set the labware `tipLength` to `92.25` for `p20_single_gen2`
+   (Fix C) so the fallback geometry is correct.
+5. Re‑verify the two carried‑over offsets after the tip model is corrected — the `−1.3 mm`
    measurement offset (how far below the target well top the sensor is lowered to take a
    reading, used in `protocol_pick_move_return.py`) and the `−80 mm` return‑drop offset (how
    far the sensor is lowered back into its charging port on return). Both were tuned against
-   the *previous* (calibrated) geometry and may shift by up to the 8.25 mm error once the
-   model is right.
-5. Keep generous `z` clearance on transit moves (Fix C).
+   the AC reference geometry and may shift by up to the 8.25 mm error once the model is right.
+6. Keep generous `z` clearance on transit moves (Fix D).
